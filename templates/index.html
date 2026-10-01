@@ -1,0 +1,74 @@
+<!doctype html>
+<html lang="es" data-theme="light">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>IA Controlador PC - Proyectos</title>
+  <link rel="stylesheet" href="/static/styles.css" />
+</head>
+<body>
+  <div id="app" class="app">
+    <header class="topbar">
+      <div class="brand">IA Controlador PC</div>
+      <div class="tabs" id="tabs"></div>
+      <div class="topbar-actions">
+        <button class="icon-btn" id="addProjectBtn" title="Añadir pestaña">+</button>
+        <button class="icon-btn" id="themeToggleBtn" title="Cambiar tema">
+          <span class="theme-label" id="themeLabel">Claro</span>
+        </button>
+      </div>
+    </header>
+
+    <main class="main">
+      <section class="workspace">
+        <div class="workspace-toolbar">
+          <button class="btn" id="runProjectBtn">Ejecutar todo</button>
+          <div class="execution-status" id="executionStatus" hidden>
+            <div class="execution-progress" aria-hidden="true">
+              <div class="execution-progress-bar" id="executionProgressBar"></div>
+            </div>
+            <div class="execution-meta">
+              <span class="execution-label" id="executionLabel">En espera</span>
+              <span class="execution-counter" id="executionCounter">0/0 · 0.0 s</span>
+            </div>
+          </div>
+          <div class="spacer"></div>
+          <div class="hint" id="projectHint"></div>
+        </div>
+
+        <div class="workspace-body">
+          <div class="editor" id="editor">
+            <svg class="wires" id="wires" xmlns="http://www.w3.org/2000/svg"></svg>
+            <div class="nodes" id="nodes"></div>
+          </div>
+
+          <aside class="inspector">
+            <div class="panel" id="inspectorPanel">
+              <div class="panel-title">Inspector</div>
+              <div class="panel-body" id="inspectorBody">
+                <div class="muted">Selecciona un nodo…</div>
+              </div>
+            </div>
+
+            <div class="panel">
+              <div class="panel-title">Consola</div>
+              <div class="panel-body console" id="console"></div>
+            </div>
+          </aside>
+        </div>
+      </section>
+    </main>
+
+    <div class="toast-stack" id="toastStack"></div>
+
+    <div class="palette" id="palette" hidden>
+      <div class="palette-inner">
+        <input id="paletteSearch" class="input" type="text" placeholder="Buscar nodo…" />
+        <div class="palette-list" id="paletteList"></div>
+      </div>
+    </div>
+  </div>
+
+  <script src="/static/app.js"></script>
+</body>
+</html>
