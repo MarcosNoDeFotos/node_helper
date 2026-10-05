@@ -23,7 +23,9 @@ class AlertNode(BaseNode):
             PortDef("exec_in", "in", RouteType.EXEC, required=True),
             PortDef("text", "in", RouteType.STRING, required=False),
         ],
-        outputs=[],
+        outputs=[
+            PortDef("exec_out", "out", RouteType.EXEC),
+        ],
         config_fields=[
             ConfigField(
                 key="text",
@@ -35,7 +37,9 @@ class AlertNode(BaseNode):
     )
 
     @classmethod
-    def evaluate_output(cls, node: NodeInstance, output_port: str, *, ctx: ResolveContext) -> Any:
+    def evaluate_output(
+        cls, node: NodeInstance, output_port: str, *, ctx: ResolveContext
+    ) -> Any:
         raise ValueError("alert no tiene salidas de datos")
 
     @classmethod
@@ -53,3 +57,4 @@ class AlertNode(BaseNode):
         if text_in is None or text_in == "":
             text_in = node.config.get("text") or ""
         emit_notification(str(text_in))
+        fire.fire("exec_out")

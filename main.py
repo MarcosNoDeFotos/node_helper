@@ -72,6 +72,26 @@ def _hidden_input_names_for_node(node: Any, defn: Any | None = None) -> set[str]
     return hidden
 
 
+def _dynamic_output_type(node: Any, port_name: str) -> RouteType | None:
+    """Tipo de salida impuesto por una opción de configuración ('set_outputs'), si existe."""
+    if node is None:
+        return None
+    node_type = node.type if hasattr(node, "type") else str((node or {}).get("type") or "")
+    cls = NODE_REGISTRY.get(node_type)
+    if not cls:
+        return None
+    config = node.config if hasattr(node, "config") else ((node or {}).get("config") or {})
+    for field in cls.definition.config_fields:
+        if field.type != "select":
+            continue
+        current_value = config.get(field.key, field.default)
+        option = next((opt for opt in field.options if opt.get("value") == current_value), None)
+        override = ((option or {}).get("set_outputs") or {}).get(port_name)
+        if override:
+            return RouteType(override)
+    return None
+
+
 def _normalize_project(project: dict[str, Any]) -> dict[str, Any]:
     nodes = []
     found_start = None
@@ -121,7 +141,18 @@ def _normalize_project(project: dict[str, Any]) -> dict[str, Any]:
         target_node = nodes_by_id.get(str(to.get("nodeId")))
         if target_node is not None and str(to.get("port")) in _hidden_input_names_for_node(target_node):
             continue
-        edges.append(copy.deepcopy(raw))
+        edge = copy.deepcopy(raw)
+        dynamic_type = _dynamic_output_type(nodes_by_id.get(str(frm.get("nodeId"))), str(frm.get("port")))
+        if dynamic_type is not None:
+            target_cls = NODE_REGISTRY.get(str(target_node.get("type"))) if target_node is not None else None
+            in_port = next(
+                (p for p in target_cls.definition.inputs if p.name == str(to.get("port"))),
+                None,
+            ) if target_cls else None
+            if in_port is not None and in_port.type not in (RouteType.ANY, dynamic_type):
+                continue
+            edge["type"] = dynamic_type.value
+        edges.append(edge)
     project["edges"] = edges
     return project
 
@@ -279,6 +310,14 @@ class Graph:
             get_node=self.get_node,
             evaluate_output=self.evaluate_output,
         )
+        values = cls.evaluate_outputs(node, ctx=ctx)
+        if values is not None:
+            if output_port not in values:
+                raise ValueError(f"Salida desconocida: {output_port}")
+            for port_name, port_value in values.items():
+                self._output_cache[(node_id, port_name)] = port_value
+            return values[output_port]
+
         val = cls.evaluate_output(node, output_port, ctx=ctx)
         self._output_cache[key] = val
         return val
@@ -345,12 +384,13 @@ def validate_project(project: dict[str, Any]) -> list[ValidationError]:
             errors.append(ValidationError(node_id=to_node.id, message="El nodo Start no admite entradas."))
             continue
 
-        if out_port.type != ed.type:
+        out_type = _dynamic_output_type(from_node, ed.from_port) or out_port.type
+        if out_type != ed.type:
             errors.append(
                 ValidationError(
                     node_id=from_node.id,
                     message=(
-                        f"La ruta '{ed.from_port}' declara tipo {ed.type.value} pero la salida es {out_port.type.value}."
+                        f"La ruta '{ed.from_port}' declara tipo {ed.type.value} pero la salida es {out_type.value}."
                     ),
                 )
             )
@@ -982,6 +1022,351 @@ def api_projects_execute_node_stream(project_id: str):
         return jsonify({"error": "JSON inválido"}), 400
     node_id = str(payload.get("nodeId") or "")
     return _stream_execution(lambda on_step: execute_node_upstream(p, node_id, on_step=on_step))
+
+
+# ----------------------------
+# Depuración (nodo a nodo)
+# ----------------------------
+
+
+class DebugStepError(Exception):
+    def __init__(self, node_id: str, message: str) -> None:
+        super().__init__(message)
+        self.node_id = node_id
+
+
+def _debug_value(value: Any) -> dict[str, Any]:
+    if isinstance(value, (bytes, bytearray)):
+        text = full = f"<{len(value)} bytes>"
+    else:
+        text = repr(value)
+        full = value if isinstance(value, str) else text
+    if len(text) > 500:
+        text = text[:500] + "…"
+    if len(full) > 1_000_000:
+        full = full[:1_000_000] + "… (truncado)"
+    return {"type": type(value).__name__, "value": text, "full": full}
+
+
+class DebugSession:
+    MAX_STEPS = 5000
+
+    def __init__(self, project: dict[str, Any]) -> None:
+        self.graph = Graph(project)
+        self.ctx = ResolveContext(
+            get_incoming_edge=self.graph.get_incoming_edge,
+            get_node=self.graph.get_node,
+            evaluate_output=self.graph.evaluate_output,
+        )
+        self.queue: list[tuple[str, bool]] = self._initial_queue()
+        self.history: list[dict[str, Any]] = []
+        self.executed: list[str] = []
+        self.console: list[str] = []
+        self.notifications: list[str] = []
+        self.new_notifications: list[str] = []
+        self.lock = threading.Lock()
+
+    def _initial_queue(self) -> list[tuple[str, bool]]:
+        g = self.graph
+        queue: list[tuple[str, bool]] = []
+        for nid, node in g.nodes.items():
+            cls = NODE_REGISTRY.get(node.type)
+            if not cls:
+                continue
+            if node.type == "start":
+                queue.append((nid, True))
+                continue
+            exec_inputs = [p for p in cls.definition.inputs if p.type == RouteType.EXEC]
+            if not exec_inputs:
+                continue
+            has_incoming = any(
+                (ed := g.get_incoming_edge(nid, p.name)) is not None and ed.type == RouteType.EXEC
+                for p in exec_inputs
+            )
+            if node.type == "if_else" and (node.config.get("mode") or "constant").lower() == "constant" and not has_incoming:
+                queue.append((nid, False))
+            elif not has_incoming:
+                queue.append((nid, True))
+        return queue
+
+    def _restore(self, snapshot: dict[str, Any]) -> None:
+        self.queue = list(snapshot["queue"])
+        self.graph._output_cache.clear()
+        self.graph._output_cache.update(snapshot["cache"])
+        del self.console[snapshot["console"]:]
+        del self.notifications[snapshot["notifications"]:]
+        del self.executed[snapshot["executed"]:]
+
+    def _input_sources(self, node_id: str) -> list[str]:
+        g = self.graph
+        node = g.nodes[node_id]
+        cls = NODE_REGISTRY.get(node.type)
+        if cls is None:
+            return []
+        hidden = _hidden_input_names_for_node(node, cls.definition)
+        sources = []
+        for p in cls.definition.inputs:
+            if p.type == RouteType.EXEC or p.name in hidden:
+                continue
+            edge = g.get_incoming_edge(node_id, p.name)
+            if edge is not None and edge.from_node in g.nodes:
+                sources.append(edge.from_node)
+        return sources
+
+    def _next_target(self) -> tuple[str, bool] | None:
+        """Nodo al que apunta el depurador: primero las entradas sin evaluar (más profundas antes), luego el nodo en cola."""
+        if not self.queue:
+            return None
+        head = self.queue[0][0]
+        done = set(self.executed)
+        visited: set[str] = set()
+
+        def visit(nid: str) -> str | None:
+            if nid in done or nid in visited:
+                return None
+            visited.add(nid)
+            for src in self._input_sources(nid):
+                found = visit(src)
+                if found is not None:
+                    return found
+            return nid
+
+        for src in self._input_sources(head):
+            found = visit(src)
+            if found is not None:
+                return found, True
+        return head, False
+
+    def _invalidate(self, node_id: str) -> None:
+        """Descarta la caché del nodo y de toda su cadena de datos dependiente para recalcularla."""
+        g = self.graph
+        stale: set[str] = set()
+        stack = [node_id]
+        while stack:
+            cur = stack.pop()
+            if cur in stale:
+                continue
+            stale.add(cur)
+            stack.extend(ed.to_node for ed in g.edges if ed.from_node == cur and ed.type != RouteType.EXEC)
+        for key in [k for k in g._output_cache if k[0] in stale]:
+            del g._output_cache[key]
+
+    def step(self) -> None:
+        target = self._next_target()
+        if target is None:
+            raise ValueError("No quedan nodos por ejecutar")
+        if len(self.executed) >= self.MAX_STEPS:
+            raise ValueError("Depuración detenida: demasiados pasos (posible ciclo infinito).")
+
+        g = self.graph
+        snapshot = {
+            "queue": list(self.queue),
+            "cache": dict(g._output_cache),
+            "console": len(self.console),
+            "notifications": len(self.notifications),
+            "executed": len(self.executed),
+        }
+        self.new_notifications = []
+        node_id, is_dependency = target
+        node = g.nodes[node_id]
+        cls = NODE_REGISTRY[node.type]
+        self._invalidate(node_id)
+
+        if is_dependency:
+            try:
+                for p in cls.definition.outputs:
+                    if p.type != RouteType.EXEC:
+                        self.ctx.output_value(node, p.name)
+            except Exception as ex:  # noqa: BLE001
+                self._restore(snapshot)
+                raise DebugStepError(node_id, str(ex)) from ex
+            self.executed.append(node_id)
+            self.history.append(snapshot)
+            return
+
+        _, triggered = self.queue.pop(0)
+        fire = ExecFire()
+        try:
+            cls.execute(
+                node,
+                triggered=triggered,
+                ctx=self.ctx,
+                fire=fire,
+                emit_console=self.console.append,
+                emit_notification=self.notifications.append,
+            )
+        except Exception as ex:  # noqa: BLE001
+            self._restore(snapshot)
+            raise DebugStepError(node_id, str(ex)) from ex
+
+        self.executed.append(node_id)
+        self.history.append(snapshot)
+        self.new_notifications = self.notifications[snapshot["notifications"]:]
+        for out_port in fire.fired_ports:
+            for ed in g.outgoing.get((node_id, out_port), []):
+                if ed.type == RouteType.EXEC:
+                    self.queue.append((ed.to_node, True))
+
+    def repeat(self) -> None:
+        if not self.history:
+            raise ValueError("No hay un nodo anterior que repetir")
+        self._restore(self.history.pop())
+        self.step()
+
+    def state(self) -> dict[str, Any]:
+        target = self._next_target()
+        return {
+            "active": True,
+            "finished": target is None,
+            "nextNodeId": target[0] if target else None,
+            "nextIsInput": bool(target and target[1]),
+            "lastNodeId": self.executed[-1] if self.executed else None,
+            "executedNodeIds": list(dict.fromkeys(self.executed)),
+            "stepCount": len(self.executed),
+            "canRepeat": bool(self.history),
+            "console": self.console,
+            "newNotifications": self.new_notifications,
+        }
+
+    def _pending_dependency(self, node: NodeInstance, port: str) -> str | None:
+        """Primer nodo de ejecución aún no ejecutado en la cadena que alimenta una entrada."""
+        g = self.graph
+        edge = g.get_incoming_edge(node.id, port)
+        if edge is None:
+            return None
+        seen: set[str] = set()
+        stack = [edge.from_node]
+        while stack:
+            cur = stack.pop()
+            if cur in seen:
+                continue
+            seen.add(cur)
+            src = g.nodes.get(cur)
+            cls = NODE_REGISTRY.get(src.type) if src else None
+            if cls is None:
+                continue
+            defn = cls.definition
+            if cur not in self.executed and any(p.type == RouteType.EXEC for p in [*defn.inputs, *defn.outputs]):
+                return cur
+            stack.extend(ed.from_node for ed in g.edges if ed.to_node == cur and ed.type != RouteType.EXEC)
+        return None
+
+    def _collect(self, node: NodeInstance, *, evaluate_outputs: bool) -> dict[str, Any]:
+        defn = NODE_REGISTRY[node.type].definition
+        hidden = _hidden_input_names_for_node(node, defn)
+        executed = node.id in self.executed
+        blocked_by: str | None = None
+        inputs = []
+        for p in defn.inputs:
+            if p.type == RouteType.EXEC or p.name in hidden:
+                continue
+            try:
+                pending = None if executed else self._pending_dependency(node, p.name)
+                if pending is not None:
+                    blocked_by = blocked_by or pending
+                    item = {"type": "pendiente", "value": f"depende de '{pending}', que aún no se ha ejecutado"}
+                else:
+                    item = _debug_value(self.ctx.input_value(node, p, default=None))
+            except Exception as ex:  # noqa: BLE001
+                item = {"type": "error", "value": str(ex)}
+            inputs.append({"name": p.name, **item})
+
+        outputs = []
+        for p in defn.outputs:
+            if p.type == RouteType.EXEC:
+                continue
+            key = (node.id, p.name)
+            try:
+                if evaluate_outputs and blocked_by is not None:
+                    item = {"type": "pendiente", "value": f"depende de '{blocked_by}', que aún no se ha ejecutado"}
+                elif evaluate_outputs:
+                    item = _debug_value(self.ctx.output_value(node, p.name))
+                elif key in self.graph._output_cache:
+                    item = _debug_value(self.graph._output_cache[key])
+                else:
+                    item = {"type": "-", "value": "(no evaluado)"}
+            except Exception as ex:  # noqa: BLE001
+                item = {"type": "error", "value": str(ex)}
+            outputs.append({"name": p.name, **item})
+        return {"inputs": inputs, "outputs": outputs}
+
+    def node_values(self, node_id: str) -> dict[str, Any]:
+        node = self.graph.nodes.get(node_id)
+        cls = NODE_REGISTRY.get(node.type) if node else None
+        if node is None or cls is None:
+            raise ValueError("Nodo no encontrado")
+        if node_id in self.executed:
+            pure = not any(p.type == RouteType.EXEC for p in [*cls.definition.inputs, *cls.definition.outputs])
+            return {"executed": True, **self._collect(node, evaluate_outputs=pure)}
+
+        defn = cls.definition
+        if any(p.type == RouteType.EXEC for p in [*defn.inputs, *defn.outputs]):
+            return {"executed": False, "inputs": self._collect(node, evaluate_outputs=False)["inputs"], "outputs": []}
+        # Nodos de solo datos: se calculan bajo demanda.
+        return {"executed": True, **self._collect(node, evaluate_outputs=True)}
+
+
+DEBUG_SESSIONS: dict[str, DebugSession] = {}
+
+
+def _debug_action(project_id: str, action: str):
+    session = DEBUG_SESSIONS.get(project_id)
+    if session is None:
+        return jsonify({"error": "No hay una depuración activa"}), 404
+    with session.lock:
+        try:
+            getattr(session, action)()
+        except DebugStepError as ex:
+            return jsonify({
+                "error": str(ex),
+                "errors": [{"node_id": ex.node_id, "message": str(ex)}],
+                "state": session.state(),
+            }), 400
+        except ValueError as ex:
+            return jsonify({"error": str(ex), "state": session.state()}), 400
+        return jsonify(session.state())
+
+
+@app.post("/api/projects/<project_id>/debug/start")
+def api_debug_start(project_id: str):
+    _ensure_seed()
+    p = PROJECTS.get(project_id)
+    if not p:
+        return jsonify({"error": "Proyecto no encontrado"}), 404
+    errors = validate_project(p)
+    if errors:
+        return jsonify({"error": "No se puede depurar", "errors": [asdict(e) for e in errors]}), 400
+    session = DebugSession(p)
+    DEBUG_SESSIONS[project_id] = session
+    return jsonify(session.state())
+
+
+@app.post("/api/projects/<project_id>/debug/step")
+def api_debug_step(project_id: str):
+    return _debug_action(project_id, "step")
+
+
+@app.post("/api/projects/<project_id>/debug/repeat")
+def api_debug_repeat(project_id: str):
+    return _debug_action(project_id, "repeat")
+
+
+@app.post("/api/projects/<project_id>/debug/stop")
+def api_debug_stop(project_id: str):
+    DEBUG_SESSIONS.pop(project_id, None)
+    return jsonify({"ok": True})
+
+
+@app.get("/api/projects/<project_id>/debug/node")
+def api_debug_node(project_id: str):
+    session = DEBUG_SESSIONS.get(project_id)
+    if session is None:
+        return jsonify({"error": "No hay una depuración activa"}), 404
+    with session.lock:
+        try:
+            return jsonify(session.node_values(str(request.args.get("nodeId") or "")))
+        except ValueError as ex:
+            return jsonify({"error": str(ex)}), 404
 
 
 _ensure_seed()

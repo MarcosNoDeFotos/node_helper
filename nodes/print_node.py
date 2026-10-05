@@ -23,7 +23,9 @@ class PrintNode(BaseNode):
             PortDef("exec_in", "in", RouteType.EXEC, required=True),
             PortDef("text", "in", RouteType.STRING, required=False),
         ],
-        outputs=[],
+        outputs=[
+            PortDef("exec_out", "out", RouteType.EXEC),
+        ],
         config_fields=[
             ConfigField(
                 key="text",
@@ -53,3 +55,4 @@ class PrintNode(BaseNode):
         if text_in is None or text_in == "":
             text_in = node.config.get("text") or ""
         emit_console(str(text_in))
+        fire.fire("exec_out")

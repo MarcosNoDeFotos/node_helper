@@ -70,6 +70,11 @@ const api = {
     if (!r.ok) throw Object.assign(new Error(data.error || 'Error al ejecutar nodo'), { data });
     return data;
   },
+  debugStart: (id) => debugRequest(id, 'start', { method: 'POST' }),
+  debugStep: (id) => debugRequest(id, 'step', { method: 'POST' }),
+  debugRepeat: (id) => debugRequest(id, 'repeat', { method: 'POST' }),
+  debugStop: (id) => debugRequest(id, 'stop', { method: 'POST' }),
+  debugNode: (id, nodeId) => debugRequest(id, `node?nodeId=${encodeURIComponent(nodeId)}`),
   async streamExecuteProject(id, onEvent) {
     return streamExecutionRequest(`/api/projects/${encodeURIComponent(id)}/execute/stream`, {
       method: 'POST',
@@ -83,6 +88,13 @@ const api = {
     }, onEvent);
   },
 };
+
+async function debugRequest(id, path, options) {
+  const r = await fetch(`/api/projects/${encodeURIComponent(id)}/debug/${path}`, options);
+  const data = await r.json().catch(() => ({}));
+  if (!r.ok) throw Object.assign(new Error(data.error || 'Error de depuración'), { data });
+  return data;
+}
 
 async function streamExecutionRequest(url, options, onEvent) {
   const r = await fetch(url, options);
@@ -143,6 +155,7 @@ const ROUTE_COLORS = {
   bytes: 'var(--wire-bytes)',
   image: 'var(--wire-image)',
   vector2: 'var(--wire-vector2)',
+  dict: 'var(--wire-dict)',
   any: 'var(--wire-exec)',
 };
 
@@ -171,6 +184,17 @@ const state = {
   viewport: { x: 0, y: 0 },
   zoom: 1,
   paletteContext: null,
+  debug: {
+    active: false,
+    busy: false,
+    finished: false,
+    canRepeat: false,
+    nextNodeId: null,
+    executedNodeIds: [],
+    nodeValues: {},
+    pending: new Set(),
+    version: 0,
+  },
   localErrorsByNode: new Map(),
   execution: {
     running: false,
@@ -190,6 +214,12 @@ const el = {
   themeToggleBtn: document.getElementById('themeToggleBtn'),
   themeLabel: document.getElementById('themeLabel'),
   runProjectBtn: document.getElementById('runProjectBtn'),
+  debugProjectBtn: document.getElementById('debugProjectBtn'),
+  debugControls: document.getElementById('debugControls'),
+  debugRepeatBtn: document.getElementById('debugRepeatBtn'),
+  debugStepBtn: document.getElementById('debugStepBtn'),
+  debugStopBtn: document.getElementById('debugStopBtn'),
+  debugStatus: document.getElementById('debugStatus'),
   executionStatus: document.getElementById('executionStatus'),
   executionProgressBar: document.getElementById('executionProgressBar'),
   executionLabel: document.getElementById('executionLabel'),
@@ -347,7 +377,7 @@ function getCompatibleOutputPort(nodeType, inputType) {
   if (!nt) return null;
   return (nt.outputs || []).find((p) => {
     if (inputType === 'exec') return p.type === 'exec';
-    return p.type === inputType;
+    return outputCanProduce(nt, p, inputType);
   }) || null;
 }
 
@@ -417,8 +447,67 @@ function applyHiddenInputsState(project) {
   return changed;
 }
 
+function getDynamicOutputType(node, portName, nt = state.nodeTypesByType[node.type]) {
+  if (!nt) return null;
+  const config = node.config || {};
+  for (const field of (nt.configFields || [])) {
+    if (field.type !== 'select') continue;
+    const value = config[field.key] ?? field.default ?? '';
+    const option = (field.options || []).find((opt) => opt.value === value);
+    const override = option && option.set_outputs && option.set_outputs[portName];
+    if (override) return override;
+  }
+  return null;
+}
+
+function getOutputPortType(node, port, nt) {
+  return getDynamicOutputType(node, port.name, nt) || port.type;
+}
+
+function outputCanProduce(nt, port, type) {
+  if (port.type === type) return true;
+  return (nt.configFields || []).some((field) => field.type === 'select'
+    && (field.options || []).some((opt) => opt.set_outputs && opt.set_outputs[port.name] === type));
+}
+
+function applyOutputOption(node, nt, portName, type) {
+  for (const field of (nt.configFields || [])) {
+    if (field.type !== 'select') continue;
+    const option = (field.options || []).find((opt) => opt.set_outputs && opt.set_outputs[portName] === type);
+    if (option) node.config[field.key] = option.value;
+  }
+}
+
+function applyOutputTypesState(project) {
+  let changed = false;
+  const nodesById = new Map(project.nodes.map((n) => [n.id, n]));
+  const nextEdges = [];
+  for (const edge of project.edges) {
+    const source = nodesById.get(edge.from.nodeId);
+    const dynamic = source ? getDynamicOutputType(source, edge.from.port) : null;
+    if (!dynamic) {
+      nextEdges.push(edge);
+      continue;
+    }
+    const target = nodesById.get(edge.to.nodeId);
+    const inPort = target ? portDef(target.type, edge.to.port, 'in') : null;
+    if (inPort && inPort.type !== 'any' && inPort.type !== dynamic) {
+      changed = true;
+      continue;
+    }
+    if (edge.type !== dynamic) {
+      edge.type = dynamic;
+      changed = true;
+    }
+    nextEdges.push(edge);
+  }
+  if (changed) project.edges = nextEdges;
+  return changed;
+}
+
 function validateProjectLocal(project) {
   const normalizedHiddenInputs = applyHiddenInputsState(project);
+  const normalizedOutputTypes = applyOutputTypesState(project);
   const errors = [];
   const incoming = projectEdgesToIncomingMap(project);
   const startNodes = project.nodes.filter(n => n.type === 'start');
@@ -479,7 +568,7 @@ function validateProjectLocal(project) {
     byNode.get(e.nodeId).push(e.message);
   }
   state.localErrorsByNode = byNode;
-  return normalizedHiddenInputs;
+  return normalizedHiddenInputs || normalizedOutputTypes;
 }
 
 function hasBlockingErrors() {
@@ -588,7 +677,7 @@ function openProjectMenu(projectId, anchor) {
     {
       label: 'Eliminar pestaña',
       onClick: async () => {
-        if (!confirm('¿Eliminar este proyecto?')) return;
+        if (!(await confirmModal('¿Eliminar este proyecto?'))) return;
         try {
           await api.deleteProject(projectId);
           await refreshProjects();
@@ -656,6 +745,7 @@ async function refreshProjects(openId) {
 
 async function openProject(id) {
   try {
+    await stopDebug();
     state.currentProject = await api.getProject(id);
     state.selectedNodeId = null;
     state.selectedNodeIds = [];
@@ -696,7 +786,8 @@ function saveProjectDebounced() {
 function renderProject() {
   if (!state.currentProject) return;
   el.projectHint.textContent = `${state.currentProject.nodes.length} nodos · ${state.currentProject.edges.length} rutas`;
-  el.runProjectBtn.disabled = hasBlockingErrors() || state.execution.running;
+  el.runProjectBtn.disabled = hasBlockingErrors() || state.execution.running || state.debug.active;
+  renderDebugControls();
   renderExecutionStatus();
   updateViewportTransform();
 
@@ -815,7 +906,7 @@ function buildScalarEditor(node, key, type, value, onAfterChange) {
     input.addEventListener('input', () => {
       node.config[key] = input.value;
       validateProjectLocal(state.currentProject);
-      el.runProjectBtn.disabled = hasBlockingErrors();
+      el.runProjectBtn.disabled = hasBlockingErrors() || state.debug.active;
       const nodeEl = el.nodes.querySelector(`[data-node-id="${CSS.escape(node.id)}"]`);
       if (nodeEl) nodeEl.classList.toggle('error', state.localErrorsByNode.has(node.id));
       saveProjectDebounced();
@@ -866,6 +957,9 @@ function renderInlineEditors(node, nt, parent) {
   box.className = 'node-inline';
 
   for (const f of (nt.configFields || [])) {
+    // Un campo de configuración con el mismo nombre que una entrada conectada se oculta.
+    if (incoming.get(`${node.id}:${f.key}`)) continue;
+    if (!isFieldVisible(f, node)) continue;
     let control;
     if (f.type === 'select') {
       const select = document.createElement('select');
@@ -879,13 +973,17 @@ function renderInlineEditors(node, nt, parent) {
       select.value = node.config[f.key] ?? f.default ?? '';
       select.addEventListener('change', () => {
         node.config[f.key] = select.value;
+        onConfigFieldChanged(node, f);
         updateNodeAndSave();
       });
       control = select;
+    } else if (f.type === 'typed_value') {
+      control = buildVariableValueEditor(node);
     } else {
       control = buildScalarEditor(node, f.key, f.type, node.config[f.key] ?? f.default, updateNodeAndSave);
     }
-    box.appendChild(createNodeField(f.label, control, f.type === 'boolean'));
+    const compact = f.type === 'boolean' || (f.type === 'typed_value' && node.config.var_type === 'boolean');
+    box.appendChild(createNodeField(f.label, control, compact));
   }
 
   for (const p of (nt.inputs || [])) {
@@ -961,6 +1059,10 @@ function renderNodes() {
     if (state.localErrorsByNode.has(n.id)) nodeEl.classList.add('error');
     if (isLockedNode(n)) nodeEl.classList.add('locked');
     if (state.execution.activeNodeIds.includes(n.id)) nodeEl.classList.add('executing');
+    if (state.debug.active) {
+      if (state.debug.executedNodeIds.includes(n.id)) nodeEl.classList.add('debug-done');
+      if (state.debug.nextNodeId === n.id) nodeEl.classList.add('debug-next');
+    }
 
     const header = document.createElement('div');
     header.className = 'node-header';
@@ -1012,7 +1114,7 @@ function renderNodes() {
       inCol.appendChild(row);
     }
     for (const p of (nt ? nt.outputs : [])) {
-      const row = portRow(n, p, 'out', { disabled: false });
+      const row = portRow(n, { ...p, type: getOutputPortType(n, p, nt) }, 'out', { disabled: false });
       outCol.appendChild(row);
     }
 
@@ -1472,13 +1574,20 @@ function renderInspector() {
     root.appendChild(ebox);
   }
 
+  renderDebugValues(node, root);
+
   el.inspectorBody.innerHTML = '';
   el.inspectorBody.appendChild(root);
 }
 
+let paletteHideTimer = null;
+
 function openPalette(context = null) {
+  window.clearTimeout(paletteHideTimer);
   state.paletteContext = context;
   el.palette.hidden = false;
+  el.palette.getBoundingClientRect();
+  el.palette.classList.add('show');
   el.paletteSearch.value = '';
   renderPaletteList('');
   setTimeout(() => {
@@ -1487,8 +1596,12 @@ function openPalette(context = null) {
 }
 
 function closePalette() {
-  el.palette.hidden = true;
   state.paletteContext = null;
+  el.palette.classList.remove('show');
+  window.clearTimeout(paletteHideTimer);
+  paletteHideTimer = window.setTimeout(() => {
+    el.palette.hidden = true;
+  }, MODAL_FADE_MS);
 }
 
 function renderPaletteList(query) {
@@ -1555,12 +1668,13 @@ function addNode(type, x, y) {
   if (pendingInput) {
     const port = getCompatibleOutputPort(type, pendingInput.toType);
     if (port) {
+      applyOutputOption(node, nt, port.name, pendingInput.toType);
       state.currentProject.edges = state.currentProject.edges.filter(e => !(e.to.nodeId === pendingInput.toNodeId && e.to.port === pendingInput.toPort));
       state.currentProject.edges.push({
         id: uid('e'),
         from: { nodeId: node.id, port: port.name },
         to: { nodeId: pendingInput.toNodeId, port: pendingInput.toPort },
-        type: port.type,
+        type: getOutputPortType(node, port, nt),
       });
     }
   }
@@ -1585,6 +1699,550 @@ async function runProject() {
     const errors = e.data && e.data.errors ? e.data.errors.map(x => x.message).join('\n') : e.message;
     toast('Ejecución', errors, 'error');
   }
+}
+
+function renderDebugControls() {
+  const d = state.debug;
+  el.debugProjectBtn.hidden = d.active;
+  el.debugProjectBtn.disabled = hasBlockingErrors() || state.execution.running;
+  el.debugControls.hidden = !d.active;
+  if (!d.active) return;
+  el.debugStepBtn.disabled = d.busy || d.finished;
+  el.debugRepeatBtn.disabled = d.busy || !d.canRepeat;
+  const next = d.nextNodeId && state.currentProject
+    ? state.currentProject.nodes.find(n => n.id === d.nextNodeId)
+    : null;
+  el.debugStatus.textContent = d.finished ? 'Depuración finalizada' : (next ? `Siguiente: ${nodeTitle(next)}${d.nextIsInput ? ' (entrada)' : ''}` : '');
+}
+
+function applyDebugState(s) {
+  const d = state.debug;
+  d.active = true;
+  d.finished = Boolean(s.finished);
+  d.canRepeat = Boolean(s.canRepeat);
+  d.nextNodeId = s.nextNodeId || null;
+  d.nextIsInput = Boolean(s.nextIsInput);
+  d.executedNodeIds = s.executedNodeIds || [];
+  d.nodeValues = {};
+  d.pending = new Set();
+  d.version += 1;
+  el.console.textContent = (s.console || []).join('\n');
+  el.console.scrollTop = el.console.scrollHeight;
+  (s.newNotifications || []).forEach(m => toast('Alert', m, 'success'));
+  renderProject();
+}
+
+function resetDebugState() {
+  Object.assign(state.debug, {
+    active: false,
+    busy: false,
+    finished: false,
+    canRepeat: false,
+    nextNodeId: null,
+    executedNodeIds: [],
+    nodeValues: {},
+    pending: new Set(),
+  });
+  state.debug.version += 1;
+}
+
+async function startDebug() {
+  if (!state.currentProject || state.debug.active) return;
+  clearConsole();
+  try {
+    applyDebugState(await api.debugStart(state.currentProject.id));
+  } catch (e) {
+    const errors = e.data && e.data.errors ? e.data.errors.map(x => x.message).join('\n') : e.message;
+    toast('Depuración', errors, 'error');
+  }
+}
+
+async function debugAction(call) {
+  if (!state.currentProject || !state.debug.active || state.debug.busy) return;
+  state.debug.busy = true;
+  renderDebugControls();
+  try {
+    applyDebugState(await call(state.currentProject.id));
+  } catch (e) {
+    if (e.data && e.data.state) applyDebugState(e.data.state);
+    const errors = e.data && e.data.errors ? e.data.errors.map(x => x.message).join('\n') : e.message;
+    toast('Depuración', errors, 'error');
+  } finally {
+    state.debug.busy = false;
+    renderDebugControls();
+  }
+}
+
+async function stopDebug() {
+  if (!state.debug.active) return;
+  const projectId = state.currentProject && state.currentProject.id;
+  resetDebugState();
+  if (projectId) await api.debugStop(projectId).catch(() => {});
+  renderProject();
+}
+
+async function loadDebugNodeValues(nodeId) {
+  const d = state.debug;
+  if (d.pending.has(nodeId) || !state.currentProject) return;
+  d.pending.add(nodeId);
+  const version = d.version;
+  let data;
+  try {
+    data = await api.debugNode(state.currentProject.id, nodeId);
+  } catch (e) {
+    data = { executed: true, inputs: [], outputs: [], error: e.message };
+  }
+  if (version !== d.version) return;
+  d.nodeValues[nodeId] = data;
+  if (state.selectedNodeId === nodeId) renderInspector();
+}
+
+function debugValuesText(data) {
+  const fmt = (rows) => rows.map(r => `${r.name}: ${r.full ?? r.value}`).join('\n');
+  return `ENTRADAS:\n${fmt(data.inputs)}\nSALIDAS:\n${fmt(data.outputs)}`;
+}
+
+async function copyDebugValues(data) {
+  try {
+    await navigator.clipboard.writeText(debugValuesText(data));
+    toast('Copiar', 'Valores copiados al portapapeles', 'success');
+  } catch (e) {
+    toast('Copiar', 'No se pudo copiar al portapapeles', 'error');
+  }
+}
+
+const MODAL_FADE_MS = 180;
+
+function domEl(tag, className = '', text = '') {
+  const node = document.createElement(tag);
+  if (className) node.className = className;
+  if (text) node.textContent = text;
+  return node;
+}
+
+function openModal({ title, onClose = null }) {
+  const backdrop = domEl('div', 'modal-backdrop');
+  const modal = domEl('div', 'modal');
+  const head = domEl('div', 'modal-head');
+  const closeBtn = domEl('button', 'btn btn-small', 'Cerrar');
+  head.appendChild(domEl('div', 'modal-title', title));
+  head.appendChild(closeBtn);
+  const body = domEl('div', 'modal-body');
+  const footer = domEl('div', 'modal-footer');
+  modal.appendChild(head);
+  modal.appendChild(body);
+  modal.appendChild(footer);
+  backdrop.appendChild(modal);
+
+  let closed = false;
+  const onKey = (e) => {
+    if (e.key !== 'Escape') return;
+    const stack = document.querySelectorAll('.modal-backdrop');
+    if (stack[stack.length - 1] !== backdrop) return;
+    e.stopPropagation();
+    close();
+  };
+  const close = () => {
+    if (closed) return;
+    closed = true;
+    window.removeEventListener('keydown', onKey, true);
+    backdrop.classList.remove('show');
+    window.setTimeout(() => backdrop.remove(), MODAL_FADE_MS);
+    if (onClose) onClose();
+  };
+
+  closeBtn.addEventListener('click', close);
+  backdrop.addEventListener('pointerdown', (e) => {
+    if (e.target === backdrop) close();
+  });
+  window.addEventListener('keydown', onKey, true);
+  document.body.appendChild(backdrop);
+  backdrop.getBoundingClientRect();
+  backdrop.classList.add('show');
+  return { body, footer, close };
+}
+
+function confirmModal(message, confirmLabel = 'Eliminar') {
+  return new Promise((resolve) => {
+    let accepted = false;
+    const m = openModal({ title: 'Confirmar', onClose: () => resolve(accepted) });
+    m.body.appendChild(domEl('div', '', message));
+    const cancel = domEl('button', 'btn', 'Cancelar');
+    cancel.addEventListener('click', m.close);
+    const ok = domEl('button', 'btn', confirmLabel);
+    ok.addEventListener('click', () => {
+      accepted = true;
+      m.close();
+    });
+    m.footer.appendChild(cancel);
+    m.footer.appendChild(ok);
+  });
+}
+
+// ---- Variables: tipos, valores y modal de configuración de listas/diccionarios ----
+
+const BASIC_VAR_TYPES = ['string', 'int', 'float', 'boolean'];
+
+function defaultVariableValue(varType) {
+  if (varType === 'int' || varType === 'float') return 0;
+  if (varType === 'boolean') return false;
+  if (varType === 'list' || varType === 'dict') return [];
+  return '';
+}
+
+function onConfigFieldChanged(node, field) {
+  if (node.type === 'variable' && (field.key === 'var_type' || field.key === 'list_subtype')) {
+    node.config.op = defaultVariableValue(node.config.var_type || 'string');
+  }
+}
+
+function isFieldVisible(field, node) {
+  const nt = state.nodeTypesByType[node.type];
+  return Object.entries(field.visibleWhen || {}).every(([key, allowed]) => {
+    const other = ((nt && nt.configFields) || []).find((f) => f.key === key);
+    const current = node.config[key] ?? (other ? other.default : undefined);
+    return allowed.includes(current);
+  });
+}
+
+function buildVariableValueEditor(node) {
+  const varType = node.config.var_type || 'string';
+  if (varType !== 'list' && varType !== 'dict') {
+    return buildScalarEditor(node, 'op', varType, node.config.op, updateNodeAndSave);
+  }
+  const count = Array.isArray(node.config.op) ? node.config.op.length : 0;
+  const wrap = domEl('div', 'variable-summary');
+  const label = varType === 'dict'
+    ? `${count} ${count === 1 ? 'entrada' : 'entradas'}`
+    : `${count} ${count === 1 ? 'elemento' : 'elementos'} (${node.config.list_subtype || 'string'})`;
+  wrap.appendChild(domEl('span', 'muted', label));
+  const btn = domEl('button', 'small-btn', 'Configurar');
+  btn.addEventListener('click', () => openVariableModal(node));
+  wrap.appendChild(btn);
+  return wrap;
+}
+
+function rawFromValue(type, value) {
+  if (type === 'boolean') return value === true || value === 'true';
+  return value === null || value === undefined ? '' : String(value);
+}
+
+function convertRaw(raw, type) {
+  if (type === 'boolean') return raw === true || String(raw).toLowerCase() === 'true';
+  return typeof raw === 'boolean' ? '' : raw;
+}
+
+function coerceRaw(type, raw) {
+  const text = String(raw).trim();
+  if (type === 'string') return { ok: true, value: String(raw) };
+  if (type === 'boolean') return { ok: true, value: raw === true || raw === 'true' };
+  if (type === 'int') return /^-?\d+$/.test(text) ? { ok: true, value: parseInt(text, 10) } : { ok: false };
+  if (type === 'float') {
+    const n = Number(text);
+    return text !== '' && Number.isFinite(n) ? { ok: true, value: n } : { ok: false };
+  }
+  return { ok: false };
+}
+
+function loadVariableWork(node, varType, subtype) {
+  const stored = Array.isArray(node.config.op) ? node.config.op : [];
+  const toEntry = (e, withKey) => {
+    const type = e && BASIC_VAR_TYPES.includes(e.type) ? e.type : 'string';
+    return { key: withKey ? String((e && e.key) ?? '') : '', type, raw: rawFromValue(type, e && e.value) };
+  };
+  if (varType === 'dict') return stored.map((e) => toEntry(e, true));
+  if (BASIC_VAR_TYPES.includes(subtype)) return stored.map((v) => ({ raw: rawFromValue(subtype, v) }));
+  return stored.map((inner) => (Array.isArray(inner) ? inner : []).map((e) => toEntry(e, subtype === 'dict')));
+}
+
+function serializeVariableWork(varType, subtype, work) {
+  const errors = [];
+  const entries = (list, withKey, where) => {
+    const seen = new Set();
+    return list.map((e, i) => {
+      const label = `${where} #${i + 1}`;
+      if (withKey) {
+        if (!e.key) errors.push(`${label}: la clave no puede estar vacía`);
+        else if (seen.has(e.key)) errors.push(`${label}: clave duplicada '${e.key}'`);
+        seen.add(e.key);
+      }
+      const r = coerceRaw(e.type, e.raw);
+      if (!r.ok) errors.push(`${label}: valor inválido para ${e.type}`);
+      const out = { type: e.type, value: r.ok ? r.value : null };
+      if (withKey) out.key = e.key;
+      return out;
+    });
+  };
+
+  let value;
+  if (varType === 'dict') {
+    value = entries(work, true, 'Entrada');
+  } else if (BASIC_VAR_TYPES.includes(subtype)) {
+    value = work.map((item, i) => {
+      const r = coerceRaw(subtype, item.raw);
+      if (!r.ok) errors.push(`Elemento #${i + 1}: valor inválido para ${subtype}`);
+      return r.ok ? r.value : null;
+    });
+  } else {
+    const kind = subtype === 'dict' ? 'Diccionario' : 'Lista';
+    value = work.map((inner, i) => entries(inner, subtype === 'dict', `${kind} ${i + 1}, entrada`));
+  }
+  return { errors, value };
+}
+
+function buildEntryRow({ entry, withKey, fixedType, onRemove, rerender }) {
+  const row = domEl('div', 'var-row');
+  if (withKey) {
+    const keyInput = domEl('input', 'input');
+    keyInput.placeholder = 'clave';
+    keyInput.value = entry.key;
+    keyInput.addEventListener('input', () => { entry.key = keyInput.value; });
+    row.appendChild(keyInput);
+  }
+  if (!fixedType) {
+    const typeSelect = domEl('select', 'select var-type');
+    for (const t of BASIC_VAR_TYPES) {
+      const option = domEl('option', '', t);
+      option.value = t;
+      typeSelect.appendChild(option);
+    }
+    typeSelect.value = entry.type;
+    typeSelect.addEventListener('change', () => {
+      entry.type = typeSelect.value;
+      entry.raw = convertRaw(entry.raw, entry.type);
+      rerender();
+    });
+    row.appendChild(typeSelect);
+  }
+  const type = fixedType || entry.type;
+  if (type === 'boolean') {
+    const sel = domEl('select', 'select');
+    for (const v of ['true', 'false']) {
+      const option = domEl('option', '', v);
+      option.value = v;
+      sel.appendChild(option);
+    }
+    sel.value = String(entry.raw === true);
+    sel.addEventListener('change', () => { entry.raw = sel.value === 'true'; });
+    row.appendChild(sel);
+  } else {
+    const input = domEl('input', 'input');
+    input.placeholder = type;
+    input.value = entry.raw;
+    input.addEventListener('input', () => { entry.raw = input.value; });
+    row.appendChild(input);
+  }
+  const remove = domEl('button', 'small-btn', '✕');
+  remove.title = 'Eliminar';
+  remove.addEventListener('click', onRemove);
+  row.appendChild(remove);
+  return row;
+}
+
+function openVariableModal(node) {
+  const varType = node.config.var_type || 'string';
+  const subtype = node.config.list_subtype || 'string';
+  const work = loadVariableWork(node, varType, subtype);
+  const m = openModal({
+    title: varType === 'dict' ? 'Configurar diccionario' : `Configurar lista de ${subtype}`,
+  });
+
+  const errorBox = domEl('div', 'modal-error');
+  const cancel = domEl('button', 'btn', 'Cancelar');
+  cancel.addEventListener('click', m.close);
+  const save = domEl('button', 'btn', 'Guardar');
+  save.addEventListener('click', () => {
+    const { errors, value } = serializeVariableWork(varType, subtype, work);
+    if (errors.length) {
+      errorBox.textContent = errors.join('\n');
+      return;
+    }
+    node.config.op = value;
+    m.close();
+    updateNodeAndSave();
+  });
+  m.footer.appendChild(errorBox);
+  m.footer.appendChild(cancel);
+  m.footer.appendChild(save);
+
+  const render = () => {
+    m.body.innerHTML = '';
+
+    const renderEntries = (container, list, withKey) => {
+      if (!list.length) container.appendChild(domEl('div', 'muted', 'Sin elementos'));
+      list.forEach((entry, i) => {
+        container.appendChild(buildEntryRow({
+          entry,
+          withKey,
+          onRemove: () => { list.splice(i, 1); render(); },
+          rerender: render,
+        }));
+      });
+      const add = domEl('button', 'small-btn', withKey ? 'Añadir entrada' : 'Añadir elemento');
+      add.addEventListener('click', () => {
+        list.push({ key: '', type: 'string', raw: '' });
+        render();
+      });
+      container.appendChild(add);
+    };
+
+    if (varType === 'dict') {
+      renderEntries(m.body, work, true);
+      return;
+    }
+
+    if (BASIC_VAR_TYPES.includes(subtype)) {
+      if (!work.length) m.body.appendChild(domEl('div', 'muted', 'Sin elementos'));
+      work.forEach((item, i) => {
+        const row = buildEntryRow({
+          entry: item,
+          withKey: false,
+          fixedType: subtype,
+          onRemove: () => { work.splice(i, 1); render(); },
+          rerender: render,
+        });
+        row.insertBefore(domEl('span', 'var-index', `#${i}`), row.firstChild);
+        m.body.appendChild(row);
+      });
+      const add = domEl('button', 'small-btn', 'Añadir elemento');
+      add.addEventListener('click', () => {
+        work.push({ raw: rawFromValue(subtype, '') });
+        render();
+      });
+      m.body.appendChild(add);
+      return;
+    }
+
+    const kind = subtype === 'dict' ? 'Diccionario' : 'Lista';
+    if (!work.length) m.body.appendChild(domEl('div', 'muted', 'Sin elementos'));
+    work.forEach((inner, i) => {
+      const card = domEl('div', 'modal-var');
+      const cardHead = domEl('div', 'modal-var-head');
+      cardHead.appendChild(domEl('strong', '', `${kind} #${i}`));
+      const remove = domEl('button', 'small-btn', `Eliminar ${kind.toLowerCase()}`);
+      remove.addEventListener('click', () => { work.splice(i, 1); render(); });
+      cardHead.appendChild(remove);
+      card.appendChild(cardHead);
+      renderEntries(card, inner, subtype === 'dict');
+      m.body.appendChild(card);
+    });
+    const addInner = domEl('button', 'small-btn', `Añadir ${kind.toLowerCase()}`);
+    addInner.addEventListener('click', () => {
+      work.push([]);
+      render();
+    });
+    m.body.appendChild(addInner);
+  };
+  render();
+}
+
+function openDebugValuesModal(node, data) {
+  const m = openModal({ title: `Valores de ${nodeTitle(node)}` });
+  const body = m.body;
+  for (const [label, rows] of [['Entradas', data.inputs], ['Salidas', data.outputs]]) {
+    const section = document.createElement('div');
+    section.className = 'debug-values-section';
+    section.textContent = label;
+    body.appendChild(section);
+    if (!rows.length) {
+      const empty = document.createElement('div');
+      empty.className = 'muted';
+      empty.textContent = 'Sin valores';
+      body.appendChild(empty);
+      continue;
+    }
+    for (const row of rows) {
+      const text = String(row.full ?? row.value);
+      const item = document.createElement('div');
+      item.className = 'modal-var';
+      const itemHead = document.createElement('div');
+      itemHead.className = 'modal-var-head';
+      const name = document.createElement('strong');
+      name.textContent = `${row.name} (${row.type})`;
+      itemHead.appendChild(name);
+      const pre = document.createElement('pre');
+      pre.className = 'modal-var-value';
+      pre.textContent = text;
+      if (text.length > 300 || text.split('\n').length > 8) {
+        const toggle = document.createElement('button');
+        toggle.className = 'btn btn-small';
+        toggle.textContent = 'Colapsar';
+        toggle.addEventListener('click', () => {
+          pre.hidden = !pre.hidden;
+          toggle.textContent = pre.hidden ? 'Expandir' : 'Colapsar';
+        });
+        itemHead.appendChild(toggle);
+      }
+      item.appendChild(itemHead);
+      item.appendChild(pre);
+      body.appendChild(item);
+    }
+  }
+}
+
+function renderDebugValues(node, root) {
+  if (!state.debug.active) return;
+  const box = document.createElement('div');
+  box.className = 'debug-values';
+  const title = document.createElement('div');
+  title.className = 'debug-values-title';
+  title.textContent = 'Valores del nodo (depuración)';
+  box.appendChild(title);
+
+  const addMuted = (text) => {
+    const m = document.createElement('div');
+    m.className = 'muted';
+    m.textContent = text;
+    box.appendChild(m);
+  };
+
+  const data = state.debug.nodeValues[node.id];
+  if (!data) {
+    addMuted('Cargando…');
+    loadDebugNodeValues(node.id);
+  } else if (data.error) {
+    addMuted(data.error);
+  } else {
+    if (!data.executed) addMuted('Este nodo aún no se ha ejecutado.');
+    if (data.inputs.length || data.outputs.length) {
+      const actions = document.createElement('div');
+      actions.className = 'debug-values-actions';
+      const copyBtn = document.createElement('button');
+      copyBtn.className = 'btn btn-small';
+      copyBtn.textContent = 'Copiar';
+      copyBtn.addEventListener('click', () => copyDebugValues(data));
+      const viewBtn = document.createElement('button');
+      viewBtn.className = 'btn btn-small';
+      viewBtn.textContent = 'Ver';
+      viewBtn.addEventListener('click', () => openDebugValuesModal(node, data));
+      actions.appendChild(copyBtn);
+      actions.appendChild(viewBtn);
+      box.appendChild(actions);
+    }
+    for (const [label, rows] of [['Entradas', data.inputs], ['Salidas', data.outputs]]) {
+      if (!data.executed && label === 'Salidas') continue;
+      const head = document.createElement('div');
+      head.className = 'debug-values-section';
+      head.textContent = label;
+      box.appendChild(head);
+      if (!rows.length) {
+        addMuted('Sin valores');
+        continue;
+      }
+      for (const row of rows) {
+        const line = document.createElement('div');
+        line.className = 'debug-value-row';
+        const name = document.createElement('strong');
+        name.textContent = `${row.name} (${row.type}): `;
+        const value = document.createElement('code');
+        value.textContent = row.value;
+        line.appendChild(name);
+        line.appendChild(value);
+        box.appendChild(line);
+      }
+    }
+  }
+  root.appendChild(box);
 }
 
 async function runNode(nodeId) {
@@ -1613,6 +2271,7 @@ function setSelectedNodes(nodeIds) {
 function wireKeyboardShortcuts() {
   window.addEventListener('keydown', (e) => {
     if (!state.currentProject) return;
+    if (document.querySelector('.modal-backdrop')) return;
     if (document.activeElement && document.activeElement.matches('input, select, textarea')) return;
     if (el.palette.hidden === false) {
       if (e.key === 'Escape') closePalette();
@@ -1834,6 +2493,11 @@ async function init() {
     clearConsole();
     await runProject();
   });
+
+  el.debugProjectBtn.addEventListener('click', startDebug);
+  el.debugStepBtn.addEventListener('click', () => debugAction(api.debugStep));
+  el.debugRepeatBtn.addEventListener('click', () => debugAction(api.debugRepeat));
+  el.debugStopBtn.addEventListener('click', stopDebug);
 
   wireEditorInteractions();
   wireKeyboardShortcuts();

@@ -13,10 +13,7 @@ from .math_expr import MathExpressionNode
 from .print_node import PrintNode
 from .variable import VariableNode
 from .delay import DelayNode
-from .screenshot import ScreenshotNode
-from .ocr_regognize import OCRRecognizeNode
-from .mouse_click import MouseClickNode
-from .keyboard_write import KeyboardWriteNode
+from .http_get import HttpGetNode
 def get_node_registry() -> dict[str, type[BaseNode]]:
     # Registro explícito (estructura estática y fácil de extender añadiendo nuevos imports).
     return {
@@ -29,10 +26,7 @@ def get_node_registry() -> dict[str, type[BaseNode]]:
         VariableNode.definition.type: VariableNode,
         ToStringNode.definition.type: ToStringNode,
         DelayNode.definition.type: DelayNode,
-        ScreenshotNode.definition.type: ScreenshotNode,
-        OCRRecognizeNode.definition.type: OCRRecognizeNode,
-        MouseClickNode.definition.type: MouseClickNode,
-        KeyboardWriteNode.definition.type: KeyboardWriteNode,
+        HttpGetNode.definition.type: HttpGetNode,
     }
 
 

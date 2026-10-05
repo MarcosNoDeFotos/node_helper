@@ -8,6 +8,7 @@ from typing import Any, Callable, Iterable, Literal
 class RouteType(str, Enum):
     BOOLEAN = "boolean"
     LIST = "list"
+    DICT = "dict"
     INT = "int"
     FLOAT = "float"
     STRING = "string"
@@ -38,10 +39,12 @@ class PortDef:
 class ConfigField:
     key: str
     label: str
-    type: Literal["string", "int", "float", "boolean", "select"]
+    type: Literal["string", "int", "float", "boolean", "select", "typed_value"]
     default: Any = None
     required: bool = False
     options: list[dict[str, Any]] = field(default_factory=list)
+    # Solo se muestra si config[clave] está en la lista: {"var_type": ["list"]}
+    visible_when: dict[str, list[Any]] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -133,9 +136,25 @@ class ResolveContext:
 
         return default
 
+    def output_value(self, node: NodeInstance, output_port: str) -> Any:
+        return self._evaluate_output(node.id, output_port)
+
 
 class BaseNode:
     definition: NodeDef
+
+    @classmethod
+    def evaluate_outputs(
+        cls,
+        node: NodeInstance,
+        *,
+        ctx: ResolveContext,
+    ) -> dict[str, Any] | None:
+        """Devuelve {puerto: valor} con todas las salidas de datos en una sola evaluación.
+
+        Si devuelve None, el motor usa evaluate_output por cada puerto.
+        """
+        return None
 
     @classmethod
     def validate_instance(
@@ -202,6 +221,7 @@ def node_def_to_json(defn: NodeDef) -> dict[str, Any]:
                 "default": f.default,
                 "required": f.required,
                 "options": f.options,
+                "visibleWhen": f.visible_when,
             }
             for f in defn.config_fields
         ],

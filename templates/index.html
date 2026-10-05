@@ -3,13 +3,13 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>IA Controlador PC - Proyectos</title>
+  <title>Node Helper - Proyectos</title>
   <link rel="stylesheet" href="/static/styles.css" />
 </head>
 <body>
   <div id="app" class="app">
     <header class="topbar">
-      <div class="brand">IA Controlador PC</div>
+      <div class="brand">Node Helper</div>
       <div class="tabs" id="tabs"></div>
       <div class="topbar-actions">
         <button class="icon-btn" id="addProjectBtn" title="Añadir pestaña">+</button>
@@ -23,6 +23,13 @@
       <section class="workspace">
         <div class="workspace-toolbar">
           <button class="btn" id="runProjectBtn">Ejecutar todo</button>
+          <button class="btn" id="debugProjectBtn">Depurar</button>
+          <div class="debug-controls" id="debugControls" hidden>
+            <button class="btn" id="debugRepeatBtn">Repetir anterior</button>
+            <button class="btn" id="debugStepBtn">Ejecutar nodo actual</button>
+            <button class="btn" id="debugStopBtn">Detener</button>
+            <span class="debug-status" id="debugStatus"></span>
+          </div>
           <div class="execution-status" id="executionStatus" hidden>
             <div class="execution-progress" aria-hidden="true">
               <div class="execution-progress-bar" id="executionProgressBar"></div>
